@@ -36,7 +36,11 @@ _KB: dict[str, str] = {
 }
 
 # Reverse index: finished-good/raw-material SKU → first KB doc that mentions it
-_SKU_RE = re.compile(r"\b(PAS-[A-Z]{3}-\d{3}|RAW-[A-Z]{3}-\d{3})\b")
+# SKU pattern: matches both standard (PAS-SPA-500) and extended (PAS-SPA-BIO-500, RAW-SEM-003, etc.)
+# Breakdown: prefix-[letters](-[letters])*-digits
+_SKU_RE = re.compile(
+    r"\b((?:PAS|RAW)-[A-Z]+(?:-[A-Z]+)*-\d+)\b"
+)
 _KB_SKU_INDEX: dict[str, list[str]] = {}   # "PAS-SPA-500" → ["DOC-001", ...]
 for _doc_id, _content in _KB.items():
     for _sku in _SKU_RE.findall(_content):
@@ -77,6 +81,34 @@ def _search_kb_impl(query: str, doc_ids: list[str] | None = None) -> list[dict]:
     scored.sort(reverse=True)
     for _, did in scored[: max(0, 5 - len(results))]:
         results.append({"id": did, "content": _KB[did]})
+
+    # 3. Exact-SKU guard: when a specific SKU is queried, annotate every returned
+    #    document that does NOT contain that exact SKU string.  This prevents the
+    #    LLM from reading a price/spec out of a document belonging to a different
+    #    SKU (e.g. using PAS-SPA-500's price for PAS-SPA-BIO-500).
+    if skus_in_query:
+        for sku in skus_in_query:
+            sku_in_any = False
+            for doc in results:
+                if sku in doc["content"].upper():
+                    sku_in_any = True
+                else:
+                    # Inject a hard warning at the top of every irrelevant document
+                    doc["content"] = (
+                        f"[CROSS-SKU WARNING: the SKU '{sku}' does NOT appear in this "
+                        f"document. Do NOT read prices, specs, or any values from this "
+                        f"document and attribute them to '{sku}'.]\n\n"
+                        + doc["content"]
+                    )
+            if not sku_in_any:
+                results.insert(0, {
+                    "id": "_NOT_FOUND",
+                    "content": (
+                        f"EXACT-SKU-NOT-FOUND: The SKU '{sku}' does not appear in any "
+                        f"knowledge-base document. Do NOT substitute data from a different "
+                        f"SKU. Answer: '{sku}' is not listed in the available sources."
+                    ),
+                })
 
     return results
 
@@ -364,19 +396,32 @@ Artifact rules:
 - "HTML deck" / "markdown" / "slides" without explicit file format → produce HTML/markdown INLINE in answer; artifact_url stays null.
 - "PDF" / "docx" / "Word" / "pptx" / "PowerPoint" / "xlsx" / "Excel" / "downloadable" → call generate_artifact directly. Use 'data_source' in sections (e.g. data_source="/erp/inventory?type=finished_good&below_min=true") instead of 'rows' — Python fetches the data automatically. This keeps your tool call small and fast.
 
-Rules:
-1. If an entity doesn't exist in the data, say so explicitly — never invent it. LOT-YYYY-#### IDs are production lots in /erp/production-orders, not CRM orders.
-2. Financial metrics (profit margin, cost, markup) are NOT stored anywhere in the available sources — if asked, state clearly they are not available after verifying the entity exists.
-2. All numeric aggregates in tool results are pre-computed in Python — use them directly.
-3. For the latest call with a named customer: if the customer_id is given use /calls?customer_id=X directly; if only the name is given, first /crm/customers?search=<partial_name> to get the id, then /calls?customer_id=<id>. Always pick the record with the most recent date — do NOT add an outcome filter.
-4. Multi-hop BOM chain: /erp/bom?sku=PAS-X → get RAW-SKU → /erp/inventory?search=RAW-SKU (returns supplier_id) → /erp/suppliers (no filter, returns all; match by id field to get name).
-5. 'Open' opportunities = stage qualification OR negotiation (won/lost are closed). To count/sum open opps: make TWO calls — /crm/opportunities?stage=qualification[&customer_id=X] and /crm/opportunities?stage=negotiation[&customer_id=X] — then ADD the two sum_value_eur and the two total counts from those responses.
-6. For "by channel" groupings use crm_channel_breakdown — it joins opportunities to customers and sums in Python.
-7. Quality complaint transcripts: use outcome_filter=complaint_open in search_transcripts. NEVER use search_transcripts to look up a specific call — for a specific call use /calls?customer_id=X then /calls/{id}/transcript?search=.
-8. Answer concisely and factually. Do NOT show chain-of-thought or reasoning steps.
-9. When a question includes a customer_id (e.g. CUST-0137), use it directly — do NOT pre-verify by calling /crm/customers. When a question only names a customer without an ID, call /crm/customers?search=<name_partial> to find the customer_id, then proceed. Only declare a customer non-existent if the name search returns zero results AND the relevant endpoints (opportunities, orders, calls) also return zero results.
-10. For generation tasks (HTML deck, report), fetch the required data first (opportunities, orders, calls) using call_api, then produce the artifact inline.
-11. For binary file requests: after generate_artifact returns successfully, write a 1-2 sentence summary answer (what the file contains) — the artifact_url will be attached automatically."""
+Operational rules:
+1. PREMISE FIRST: before answering about a specific entity, verify it exists in the tool results. If a named customer/SKU/lot/supplier was not found in the search results (empty data array, or search returns zero results), say explicitly "X does not exist in the available data" — never fabricate attributes.
+2. Financial metrics (profit margin, cost, markup) are NOT stored anywhere — state clearly they are not available after confirming the entity exists.
+3. All numeric aggregates in tool results are pre-computed in Python — use them directly; never re-add or recompute from a list unless tool result is missing the sum.
+4. For the latest call with a named customer: if the customer_id is given use /calls?customer_id=X directly; if only the name is given, first /crm/customers?search=<partial_name> to get the id, then /calls?customer_id=<id>. Pick the record with the most recent date.
+5. ERP multi-hop BOM/supply chain — follow EXACTLY these steps using real IDs from each prior step:
+   Step 1: /erp/bom?sku=PAS-XXX-NNN → read each component's raw material SKU (exact field value, do not alter)
+   Step 2: /erp/inventory?search=<raw_material_sku_from_step1> → read supplier_id from that record
+   Step 3: /erp/suppliers (no filters) → find the entry whose "id" field equals the supplier_id from Step 2
+   Never skip a step, never substitute IDs.
+6. 'Open' opportunities = stage qualification OR negotiation. Make TWO calls — /crm/opportunities?stage=qualification and /crm/opportunities?stage=negotiation — then sum both total and sum_value_eur in Python.
+7. For "by channel" groupings use crm_channel_breakdown.
+8. Quality complaint counts: use search_transcripts with outcome_filter=complaint_open. For a specific call use /calls?customer_id=X then /calls/{id}/transcript?search=.
+9. Answer concisely and factually. Do NOT show chain-of-thought or reasoning steps.
+10. Customer lookup: if question includes a customer_id (e.g. CUST-0137), use it directly. If only a name is given, call /crm/customers?search=<name_partial> first. Declare non-existent only if both name search AND the relevant endpoint return zero results.
+11. For generation tasks (HTML deck, report), fetch required data first, then produce inline.
+12. For binary file requests: after generate_artifact returns, write a 1-2 sentence summary.
+
+GROUNDING MANDATE — apply to every answer:
+- Your answer must contain ONLY facts that appear verbatim in the tool results returned above.
+- Before writing each claim, check: does this exact number / name / date appear in a tool result? If not, do not include it.
+- If a required fact is absent from all tool results, write "not available in the sources" — never guess.
+- EXACT-SKU RULE: when a question names a specific SKU (e.g. PAS-SPA-BIO-500), price/spec values MUST come from a document that contains that EXACT SKU id. Never use data from a different SKU (e.g. PAS-SPA-500) even if the names are similar. If the search_kb result contains "EXACT-SKU-NOT-FOUND" for a SKU, that SKU is not in the knowledge base — state this explicitly.
+- The same exact-match rule applies to lot IDs, supplier IDs, and document IDs.
+- For numeric answers: find the exact value in tool results. Use pre-computed sums (sum_value_eur etc.) directly. Do not add up individual records in your head.
+- "Not found" is a valid, correct answer and scores better than a hallucinated one."""
 
 
 # ── Tool definitions ──────────────────────────────────────────────────────────
@@ -388,9 +433,12 @@ _TOOLS: list[dict] = [
             "name": "call_api",
             "description": (
                 "Call any Al Dente API endpoint. All pages are fetched automatically. "
-                "Numeric fields are pre-summed in the result as sum_<field>.\n"
-                "Endpoints (filters are exact-match, case-sensitive):\n"
-                "  /crm/customers  [search=<name_partial>, channel=(GDO|distributor|horeca), status=(active|inactive|prospect)]  — NOTE: no customer_id filter; cannot look up by ID here\n"
+                "Numeric fields are pre-summed in the result as sum_<field>. "
+                "IMPORTANT: all filter values are EXACT-MATCH and CASE-SENSITIVE "
+                "(e.g. stage='qualification' not 'Qualification'). "
+                "Always check the 'total' field in the response before treating the result as complete.\n"
+                "Endpoints:\n"
+                "  /crm/customers  [search=<name_partial>, channel=(GDO|distributor|horeca), status=(active|inactive|prospect)]\n"
                 "  /crm/customers/{id}\n"
                 "  /crm/opportunities  [customer_id, stage=(qualification|negotiation|won|lost), owner]\n"
                 "  /crm/orders  [customer_id, status=(open|in_production|shipped|delivered|cancelled), from, to]\n"
@@ -400,7 +448,7 @@ _TOOLS: list[dict] = [
                 "  /calls/{id}/transcript  [search=<keyword>, speaker]  — always use search= to filter\n"
                 "  /erp/production-orders  [customer_id, status=(planned|in_progress|done|blocked), sku, from, to]\n"
                 "  /erp/inventory  [type=(finished_good|raw_material), below_min=true, search=<sku>]  — raw_material rows include supplier_id\n"
-                "  /erp/suppliers  [search=<name>, category=(semolina|wheat|packaging|labels|ink|logistics)]  — use no filter to list all; each record has id and name\n"
+                "  /erp/suppliers  [search=<name>, category=(semolina|wheat|packaging|labels|ink|logistics)]  — use no filter to list all\n"
                 "  /erp/bom  [sku=<PAS-XXX-###>]\n"
                 "  /erp/shipments  [customer_id, order_id, status=(in_transit|delivered|delayed)]"
             ),
@@ -796,6 +844,12 @@ def _run_tool(name: str, args: dict) -> tuple[str, list[str], str]:
             result = _api_call(endpoint, params)
             segs = [s for s in endpoint.split("/") if s]
             cat = segs[0] if segs and segs[0] in ("crm", "erp", "calls") else "unknown"
+            # Augment empty-list results with an explicit "not found" signal
+            if isinstance(result, dict) and result.get("total") == 0:
+                result["_not_found"] = (
+                    f"No records returned for {endpoint} with params {params}. "
+                    "The entity you are looking for does not exist in this data source."
+                )
             return json.dumps(result), [endpoint.lstrip("/")], cat
         except httpx.HTTPStatusError as e:
             body = {
@@ -992,8 +1046,8 @@ def _run_binary_artifact(
 
 # ── Agent loop ────────────────────────────────────────────────────────────────
 
-_MAX_STEPS = 12
-_REQUEST_BUDGET = 26.0  # total seconds allowed for the whole agent run
+_MAX_STEPS = 8          # hard cap on LLM turns (most questions finish in 3-5)
+_REQUEST_BUDGET = 24.0  # total seconds budget; leaves 6s buffer before the 30s wall
 
 
 def run_agent(question: str) -> dict:
@@ -1045,14 +1099,15 @@ def run_agent(question: str) -> dict:
     sources: list[str] = []
     cats: list[str] = []
     artifact_url: str | None = None
+    last_tool_results: list[str] = []   # accumulate for grounding context
 
     for _step in range(_MAX_STEPS):
         remaining = _REQUEST_BUDGET - (time.monotonic() - t0)
-        if remaining < 3:
+        if remaining < 4:
             break
-        step_timeout = min(20.0, remaining - 1.5)
-        # For binary artifacts: force generate_artifact on step 0 so the model fills
-        # in data_source directly — avoids multiple pre-fetch LLM turns
+        # Leave at least 6s for LLM inference; if tighter, go straight to wrap-up
+        step_timeout = min(18.0, remaining - 4.0)
+        # For binary artifacts: force generate_artifact on step 0
         if binary_fmt and _step == 0:
             tc_choice: str | dict = {
                 "type": "function",
@@ -1079,11 +1134,11 @@ def run_agent(question: str) -> dict:
             content = getattr(msg, "reasoning_content", None) or ""
         # Strip Qwen3 <think>…</think> chain-of-thought blocks
         content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-        # Strip Mistral / other models' reasoning preambles that leak into content
+        # Strip reasoning preambles that leak into content
         content = _strip_preamble(content)
 
         if not msg.tool_calls:
-            # Clean up any hallucinated artifact URLs the model put in text
+            # Model gave a direct answer — clean and return
             clean = re.sub(r"\[?artifact_url\]?:\s*\S+", "", content, flags=re.IGNORECASE).strip()
             clean = re.sub(r"https?://\S+\.(pdf|docx|pptx|xlsx)\S*", "", clean, flags=re.IGNORECASE).strip()
             out = {
@@ -1115,6 +1170,18 @@ def run_agent(question: str) -> dict:
         )
 
         for tc in msg.tool_calls:
+            # Per-tool time gate: stop executing tools if budget nearly gone
+            if time.monotonic() - t0 > _REQUEST_BUDGET - 5:
+                # Still need to append a placeholder so the conversation is valid
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps({"error": "time budget exceeded; tool skipped"}),
+                    }
+                )
+                continue
+
             try:
                 args = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
@@ -1124,6 +1191,7 @@ def run_agent(question: str) -> dict:
             sources.extend(new_sources)
             if cat:
                 cats.append(cat)
+            last_tool_results.append(result_json)
             # Track artifact_url produced by generate_artifact
             try:
                 rd = json.loads(result_json)
@@ -1136,15 +1204,24 @@ def run_agent(question: str) -> dict:
                 {"role": "tool", "tool_call_id": tc.id, "content": result_json}
             )
 
-    # Step/time limit hit — request a summary answer
+    # Step/time limit hit — request a grounded summary answer
     remaining = _REQUEST_BUDGET - (time.monotonic() - t0)
-    if remaining > 3:
+    if remaining > 6:
         try:
             final = llm.chat.completions.create(
                 model=model,
-                messages=messages
-                + [{"role": "user", "content": "Summarise your findings and give a final answer now."}],
-                timeout=min(18.0, remaining - 1),
+                messages=messages + [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Give your final answer now, in 1-3 sentences. "
+                            "Base EVERY fact strictly on the tool results above — "
+                            "if a required fact is not in those results, say "
+                            "'not available in the sources'. Do not guess."
+                        ),
+                    }
+                ],
+                timeout=min(10.0, remaining - 3),
             )
             content = re.sub(
                 r"<think>.*?</think>",
@@ -1155,9 +1232,13 @@ def run_agent(question: str) -> dict:
             content = _strip_preamble(content)
             content = content or "Step limit reached; answer may be incomplete."
         except Exception:
-            content = "Unable to complete the answer within the step limit."
+            content = "Unable to complete the answer within the time budget."
     else:
-        content = "The request could not be completed within the time budget."
+        # No time for another LLM call — return honest partial answer
+        content = (
+            "The answer could not be completed within the time budget. "
+            "Please try again or rephrase the question."
+        )
 
     out = {
         "answer": content,

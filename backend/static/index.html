@@ -320,6 +320,9 @@ header{display:flex;align-items:center;gap:12px;padding:0 20px;
 
     <!-- edge breakdown -->
     <div class="edge-breakdown" id="edge-breakdown">Loading graph…</div>
+    <div style="padding:2px 12px 4px;font-size:9px;color:var(--text-3);font-family:var(--mono)">
+      Entity graph: customers · suppliers · SKUs · raw materials — click any node to highlight neighbors
+    </div>
 
     <!-- toolbar -->
     <div class="graph-toolbar">
@@ -328,8 +331,8 @@ header{display:flex;align-items:center;gap:12px;padding:0 20px;
         <input type="text" id="graph-search" placeholder="Search + 1-hop…" oninput="searchGraph(this.value)">
       </div>
       <div class="mode-grp">
-        <button class="btn-graph active" id="btn-readable" onclick="setGraphMode('readable')">Readable</button>
-        <button class="btn-graph" id="btn-full" onclick="setGraphMode('full')">Full</button>
+        <button class="btn-graph active" id="btn-readable" onclick="setGraphMode('readable')">Entity graph</button>
+        <button class="btn-graph" id="btn-full" onclick="setGraphMode('full')" title="Full graph may take a few seconds to stabilize">+ KB docs</button>
       </div>
       <button class="btn-graph" onclick="fitGraph()">⛶ Fit</button>
       <button class="btn-graph" onclick="resetView()">↺</button>
@@ -347,11 +350,6 @@ header{display:flex;align-items:center;gap:12px;padding:0 20px;
         <button class="filter-btn on" data-type="supplier"     onclick="filterNodes('supplier')">Suppliers</button>
         <button class="filter-btn on" data-type="product"      onclick="filterNodes('product')">SKUs</button>
         <button class="filter-btn on" data-type="raw_material" onclick="filterNodes('raw_material')">Raw mat</button>
-        <button class="filter-btn on" data-type="opportunity"  onclick="filterNodes('opportunity')">Opps</button>
-        <button class="filter-btn on" data-type="order"        onclick="filterNodes('order')">Orders</button>
-        <button class="filter-btn on" data-type="lot"          onclick="filterNodes('lot')">Lots</button>
-        <button class="filter-btn on" data-type="call"         onclick="filterNodes('call')">Calls</button>
-        <button class="filter-btn on" data-type="kb_doc"       onclick="filterNodes('kb_doc')">KB Docs</button>
       </div>
     </div>
 
@@ -423,11 +421,12 @@ const TC={
   shipment:    {color:'#06B6D4',border:'#0891B2',font:'#fff',shape:'box',    size:12},
 };
 const ALERT_BORDER='#EF4444';
-const READABLE_LIMIT=140;
 
 /* ── State ────────────────────────────────────────────────────────── */
 let network=null, networkNodes=null, networkEdges=null;
 let rawGraphData=null;
+let allGraphEdges=[];              // full edge list for 1-hop search
+let currentSubgraphNodeIds=new Set(); // node IDs in current vis DataSet
 let graphMode='readable';
 let activeTypeFilter='all';
 let abortCtrl=null;
@@ -605,16 +604,38 @@ window.toggleHistory=function(){
 function loadHistory(){renderHistory(getHistory());}
 
 /* ── Graph: build ────────────────────────────────────────────────── */
+function setOverlay(msg,show){
+  const ov=document.getElementById('graph-overlay');
+  if(!show){ov.classList.add('hidden');return;}
+  ov.classList.remove('hidden');
+  const msgEl=document.getElementById('overlay-msg');
+  if(msgEl)msgEl.textContent=msg;
+  const spin=ov.querySelector('.spinner');
+  if(spin)spin.style.display='';
+  const icon=ov.querySelector('.overlay-icon');
+  if(icon)icon.textContent='🕸️';
+}
+
+function microtask(){return new Promise(r=>setTimeout(r,16));}
+
 async function loadGraph(){
+  setOverlay('Fetching graph data…',true);
   try{
     const resp=await fetch('/graph-data');
     if(!resp.ok)throw new Error(`HTTP ${resp.status}`);
     rawGraphData=await resp.json();
     if(rawGraphData.error)throw new Error(rawGraphData.error);
-    buildNetwork(rawGraphData);
+    allGraphEdges=rawGraphData.edges||[];
     updateStats(rawGraphData.stats||{});
     updateDiag(rawGraphData.stats||{});
-  }catch(err){showGraphError(err.message);}
+    setText('st-edges',String(allGraphEdges.length));
+    setOverlay('Rendering network…',true);
+    await microtask();
+    renderNetwork(rawGraphData.nodes||[],rawGraphData.edges||[]);
+  }catch(err){
+    console.error('[graph]',err);
+    showGraphError(err.message);
+  }
 }
 
 function updateStats(stats){
@@ -623,12 +644,15 @@ function updateStats(stats){
   setText('st-prod', bt.product     ||stats.product     ||'—');
   setText('st-raw',  bt.raw_material||stats.raw_material||'—');
   setText('st-supp', bt.supplier    ||stats.supplier    ||'—');
-  setText('st-edges',stats.edge_count||stats.edges      ||'—');
   setText('st-alert',stats.below_min||'—');
-  // edge breakdown bar
   const ebt=stats.edges_by_type||{};
   const ebtStr=Object.entries(ebt).sort(([,a],[,b])=>b-a).map(([k,v])=>`${k}:${v}`).join('  ·  ');
   setText('edge-breakdown',ebtStr||'—');
+}
+
+function updateEdgesKPI(n){
+  const el=document.getElementById('st-edges');
+  if(el)el.textContent=String(n);
 }
 
 function updateDiag(stats){
@@ -652,54 +676,118 @@ window.toggleDiag=function(){
 function showGraphError(msg){
   const ov=document.getElementById('graph-overlay');
   ov.classList.remove('hidden');
-  ov.innerHTML=`<div style="padding:20px;text-align:center;color:var(--text-2)">
-    <div style="font-size:32px;margin-bottom:8px">⚠️</div>
-    <b style="color:var(--text)">Graph unavailable</b><br>
-    <span style="font-size:12px">${esc(msg)}</span></div>`;
+  // preserve overlay-msg if it exists
+  const msgEl=document.getElementById('overlay-msg');
+  if(msgEl)msgEl.textContent='⚠️ '+msg;
+  const spin=ov.querySelector('.spinner');
+  if(spin)spin.style.display='none';
+  const icon=ov.querySelector('.overlay-icon');
+  if(icon)icon.textContent='⚠️';
   setText('edge-breakdown','graph unavailable — check API credentials');
+  console.error('[graph-error]',msg);
 }
 
-function buildNetwork(data){
-  const nodes=data.nodes||[];
-  const edges=data.edges||[];
-  const visNodes=nodes.map(n=>nodeToVis(n));
-  const visEdges=edges.map((e,i)=>({
-    id:i,from:e.from,to:e.to,label:e.label||'',
-    color:{color:'rgba(26,25,24,.10)',highlight:'#BEF264',hover:'#BEF264'},
-    font:{size:9,color:'#9B9692',align:'middle',strokeWidth:0},
-    smooth:{type:'dynamic',roundness:0.3},
-    arrows:{to:{enabled:true,scaleFactor:0.45}},
+/* ── Edge vis helper ─────────────────────────────────────────────── */
+function edgeToVis(e,i){
+  return{
+    id:i,from:e.from,to:e.to,label:'',
+    color:{color:'rgba(26,25,24,.12)',highlight:'#BEF264',hover:'#BEF264'},
+    arrows:{to:{enabled:true,scaleFactor:0.4}},
     width:1,hoverWidth:2,selectionWidth:2.5,
-  }));
-  networkNodes=new vis.DataSet(visNodes);
-  networkEdges=new vis.DataSet(visEdges);
-  const container=document.getElementById('graph-canvas');
-  const options={
-    nodes:{borderWidth:1.5,borderWidthSelected:3,
-      font:{size:10,face:'Inter,sans-serif',multi:false},
-      shadow:{enabled:true,size:5,x:0,y:2,color:'rgba(0,0,0,.07)'}},
-    edges:{font:{size:9,face:'Inter,sans-serif',strokeWidth:0,color:'#9B9692'},selectionWidth:2.5},
-    interaction:{hover:true,tooltipDelay:200,hideEdgesOnDrag:true,multiselect:false},
-    physics:{
-      forceAtlas2Based:{gravitationalConstant:-40,centralGravity:0.006,
-        springLength:200,springConstant:0.06,damping:0.4,avoidOverlap:0.5},
-      maxVelocity:100,solver:'forceAtlas2Based',
-      stabilization:{enabled:true,iterations:200,updateInterval:20},
-    },
-    layout:{improvedLayout:false},
+    _type:e.type,_label:e.label||'',
   };
-  network=new vis.Network(container,{nodes:networkNodes,edges:networkEdges},options);
-  network.on('stabilized',()=>{
-    document.getElementById('graph-overlay').classList.add('hidden');
-    applyVisibility();
-    fitGraph();
-  });
+}
+
+/* ── renderNetwork ───────────────────────────────────────────────── */
+function renderNetwork(nodes,edges){
+  if(network){try{network.destroy();}catch(e){}network=null;}
+  currentSubgraphNodeIds=new Set(nodes.map(n=>n.id));
+  networkNodes=new vis.DataSet(nodes.map(n=>nodeToVis(n)));
+  networkEdges=new vis.DataSet(edges.map((e,i)=>edgeToVis(e,i)));
+  const container=document.getElementById('graph-canvas');
+  try{
+    network=new vis.Network(container,{nodes:networkNodes,edges:networkEdges},{
+      nodes:{borderWidth:1.5,borderWidthSelected:3,
+        font:{size:10,face:'Inter,sans-serif'},
+        shadow:{enabled:true,size:4,x:0,y:2,color:'rgba(0,0,0,.07)'}},
+      edges:{
+        smooth:{type:'continuous',forceDirection:'none'},
+        font:{size:0},
+        arrows:{to:{enabled:true,scaleFactor:0.4}},
+        color:{color:'rgba(26,25,24,.12)',highlight:'#BEF264',hover:'#BEF264'},
+        width:1,hoverWidth:2,selectionWidth:2.5,
+      },
+      interaction:{hover:true,tooltipDelay:150,hideEdgesOnDrag:true,multiselect:false},
+      physics:{
+        enabled:true,solver:'barnesHut',
+        barnesHut:{gravitationalConstant:-4000,centralGravity:0.25,
+          springLength:130,springConstant:0.04,damping:0.1,avoidOverlap:0.4},
+        maxVelocity:80,
+        stabilization:{enabled:true,iterations:180,updateInterval:20},
+      },
+      layout:{improvedLayout:false},
+    });
+  }catch(err){
+    console.error('[vis] network init error:',err);
+    showGraphError('Rendering error: '+err.message);
+    return;
+  }
+  let settled=false;
+  const onSettled=()=>{
+    if(settled)return;
+    settled=true;
+    network.stopSimulation();
+    setOverlay('',false);
+    network.fit({animation:{duration:400,easingFunction:'easeInOutQuad'}});
+  };
+  network.once('stabilizationIterationsDone',onSettled);
+  network.once('stabilized',onSettled);
+  setTimeout(onSettled,4000);
   network.on('click',params=>{
-    if(params.nodes.length)openDrawer(params.nodes[0]);
-    else closeDrawer();
+    if(params.nodes.length){
+      highlightNeighbors(params.nodes[0]);
+      openDrawer(params.nodes[0]);
+    }else{
+      clearHighlight();
+      closeDrawer();
+    }
   });
   network.on('hoverNode',()=>{container.style.cursor='pointer';});
   network.on('blurNode', ()=>{container.style.cursor='default';});
+}
+
+/* ── Click-to-highlight 1-hop neighbors ─────────────────────────── */
+function highlightNeighbors(nodeId){
+  if(!networkNodes||!rawGraphData)return;
+  const neighbors=new Set([nodeId]);
+  for(const e of allGraphEdges){
+    if(e.from===nodeId)neighbors.add(e.to);
+    if(e.to===nodeId)neighbors.add(e.from);
+  }
+  networkNodes.update(networkNodes.getIds().map(id=>({
+    id,
+    opacity:neighbors.has(id)?1:0.2,
+    color:id===nodeId
+      ?{background:'#BEF264',border:'#8AAA00',highlight:{background:'#D4FF6E',border:'#6A8000'}}
+      :undefined,
+    borderWidth:id===nodeId?4:1.5,
+  })));
+  networkEdges.update(networkEdges.get().map(e=>({
+    id:e.id,
+    color:{color:(neighbors.has(e.from)&&neighbors.has(e.to))?'rgba(26,25,24,.25)':'rgba(26,25,24,.04)',
+           highlight:'#BEF264',hover:'#BEF264'},
+    width:(neighbors.has(e.from)&&neighbors.has(e.to))?2:0.5,
+  })));
+}
+
+function clearHighlight(){
+  if(!networkNodes||!networkEdges)return;
+  networkNodes.update(networkNodes.getIds().map(id=>({id,opacity:1,color:undefined,borderWidth:1.5})));
+  networkEdges.update(networkEdges.get().map(e=>({
+    id:e.id,
+    color:{color:'rgba(26,25,24,.12)',highlight:'#BEF264',hover:'#BEF264'},
+    width:1,
+  })));
 }
 
 function nodeToVis(n){
@@ -737,33 +825,37 @@ function buildTooltip(n){
   return lines.join('<br>');
 }
 
-/* ── Readable / Full mode ────────────────────────────────────────── */
-function getReadableIds(data){
-  if(!data?.nodes)return new Set();
-  const sorted=[...data.nodes].sort((a,b)=>(b.priority||0)-(a.priority||0));
-  return new Set(sorted.slice(0,READABLE_LIMIT).map(n=>n.id));
-}
-
+/* ── Mode toggle (entity graph / + KB docs) ─────────────────────── */
 window.setGraphMode=function(mode){
+  if(graphMode===mode)return;
   graphMode=mode;
   document.getElementById('btn-readable').classList.toggle('active',mode==='readable');
   document.getElementById('btn-full').classList.toggle('active',mode==='full');
-  applyVisibility();fitGraph();
+  if(!rawGraphData)return;
+  setOverlay('Rendering network…',true);
+  setTimeout(async()=>{
+    await microtask();
+    renderNetwork(rawGraphData.nodes||[],rawGraphData.edges||[]);
+    updateEdgesKPI(allGraphEdges.length);
+  },16);
 };
 
 function applyVisibility(){
-  if(!networkNodes||!networkEdges||!rawGraphData)return;
-  const rIds=graphMode==='readable'?getReadableIds(rawGraphData):null;
+  if(!networkNodes||!networkEdges)return;
+  clearHighlight();
   const tf=activeTypeFilter;
-  const nodeUpd=rawGraphData.nodes.map(n=>({
-    id:n.id,
-    hidden:(rIds&&!rIds.has(n.id))||(tf!=='all'&&n.type!==tf),
-  }));
-  networkNodes.update(nodeUpd);
-  const visible=new Set(nodeUpd.filter(u=>!u.hidden).map(u=>u.id));
-  networkEdges.update(rawGraphData.edges.map((e,i)=>({
-    id:i,hidden:!visible.has(e.from)||!visible.has(e.to),
-  })));
+  if(tf==='all'){
+    networkNodes.update(networkNodes.getIds().map(id=>({id,hidden:false,opacity:1})));
+    networkEdges.update(networkEdges.getIds().map(id=>({id,hidden:false})));
+    return;
+  }
+  const visible=new Set();
+  networkNodes.getIds().forEach(id=>{
+    const item=networkNodes.get(id);
+    if(item&&item._type===tf)visible.add(id);
+  });
+  networkNodes.update(networkNodes.getIds().map(id=>({id,hidden:!visible.has(id),opacity:1})));
+  networkEdges.update(networkEdges.get().map(e=>({id:e.id,hidden:!visible.has(e.from)||!visible.has(e.to)})));
 }
 
 window.filterNodes=function(type){
@@ -780,11 +872,13 @@ window.fitGraph=function(){
 };
 
 window.resetView=function(){
-  if(!networkNodes||!rawGraphData)return;
   document.getElementById('graph-search').value='';
-  networkNodes.update(rawGraphData.nodes.map(n=>({...nodeToVis(n)})));
-  networkEdges.update(rawGraphData.edges.map((e,i)=>({id:i,color:{color:'rgba(26,25,24,.10)'},width:1})));
   closeDrawer();
+  activeTypeFilter='all';
+  document.querySelectorAll('.filter-btn').forEach(b=>{
+    b.classList.toggle('on',b.dataset.type==='all');
+  });
+  clearHighlight();
   applyVisibility();
   fitGraph();
 };
@@ -794,24 +888,26 @@ window.searchGraph=function(query){
   if(!networkNodes||!rawGraphData)return;
   const q=query.trim().toLowerCase();
   if(!q){applyVisibility();return;}
-  const matchIds=new Set(rawGraphData.nodes
+  const matchIds=new Set((rawGraphData.nodes||[])
     .filter(n=>[n.id,n.label,(n.meta?.name||''),(n.meta?.description||''),(n.meta?.title||'')]
       .join(' ').toLowerCase().includes(q))
     .map(n=>n.id));
-  // include 1-hop neighbors
+  if(!matchIds.size){applyVisibility();return;}
   const showIds=new Set(matchIds);
-  for(const e of rawGraphData.edges){
+  for(const e of allGraphEdges){
     if(matchIds.has(e.from))showIds.add(e.to);
     if(matchIds.has(e.to))showIds.add(e.from);
   }
-  networkNodes.update(rawGraphData.nodes.map(n=>({
-    id:n.id,hidden:!showIds.has(n.id),
-    borderWidth:matchIds.has(n.id)?4:1.5,
+  const currentIds=networkNodes.getIds();
+  networkNodes.update(currentIds.map(id=>({
+    id,hidden:!showIds.has(id),opacity:1,
+    borderWidth:matchIds.has(id)?4:1.5,
   })));
-  networkEdges.update(rawGraphData.edges.map((e,i)=>({
-    id:i,hidden:!showIds.has(e.from)||!showIds.has(e.to),
+  networkEdges.update(networkEdges.get().map(e=>({
+    id:e.id,hidden:!showIds.has(e.from)||!showIds.has(e.to),
   })));
-  if(matchIds.size)network.fit({nodes:[...matchIds],animation:{duration:400}});
+  const focusIds=[...matchIds].filter(id=>currentSubgraphNodeIds.has(id));
+  if(focusIds.length)network.fit({nodes:focusIds,animation:{duration:400}});
 };
 
 /* ── Highlight from answer ───────────────────────────────────────── */
@@ -819,15 +915,14 @@ function highlightByAnswer(question,data){
   if(!networkNodes||!rawGraphData)return;
   const text=question+' '+(data.answer||'')+' '+(data.sources||[]).join(' ');
   const ids=new Set(findIds(text));
-  const nodeIds=new Set(rawGraphData.nodes.map(n=>n.id));
-  const matchIds=new Set([...ids].filter(id=>nodeIds.has(id)));
+  const matchIds=new Set([...ids].filter(id=>currentSubgraphNodeIds.has(id)));
   if(!matchIds.size)return;
-  networkNodes.update(rawGraphData.nodes.map(n=>({
-    id:n.id,
-    borderWidth:matchIds.has(n.id)?4:1.5,
-    color:matchIds.has(n.id)?{background:'#BEF264',border:'#8AAA00',
+  networkNodes.update(networkNodes.getIds().map(id=>({
+    id,
+    borderWidth:matchIds.has(id)?4:1.5,
+    color:matchIds.has(id)?{background:'#BEF264',border:'#8AAA00',
       highlight:{background:'#D4FF6E',border:'#6A8000'}}:undefined,
-    font:matchIds.has(n.id)?{color:'#1A1918'}:undefined,
+    font:matchIds.has(id)?{color:'#1A1918'}:undefined,
   })));
   setTimeout(()=>{
     if(matchIds.size)network.fit({nodes:[...matchIds],animation:{duration:450}});

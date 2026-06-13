@@ -211,6 +211,9 @@ async def _build_graph() -> dict:
         (customers, fg_items, rm_items, suppliers, orders) = [
             r if not isinstance(r, Exception) else [] for r in raw_results
         ]
+        # Warn if any critical list is empty
+        if not fg_items:
+            print("[graph] WARNING: finished_goods returned empty — BOM edges will be missing")
         record_counts = {
             "customers": len(customers), "finished_goods": len(fg_items),
             "raw_materials": len(rm_items), "suppliers": len(suppliers),
@@ -350,7 +353,14 @@ async def _build_graph() -> dict:
 async def graph_data() -> JSONResponse:
     cached = _GRAPH_CACHE.get("data")
     if cached and time.time() - _GRAPH_CACHE.get("ts", 0) < _GRAPH_CACHE_TTL:
-        return JSONResponse(content=cached)
+        # Validate cached data: reject if products or BOM edges are missing
+        stats = cached.get("stats", {})
+        nbt = stats.get("nodes_by_type", {})
+        if nbt.get("product", 0) == 0 or stats.get("edge_count", 0) < 20:
+            print("[graph] Cache invalid (missing products/edges) — rebuilding")
+            _GRAPH_CACHE.clear()
+        else:
+            return JSONResponse(content=cached)
     try:
         data = await _build_graph()
     except Exception as exc:
@@ -361,6 +371,8 @@ async def graph_data() -> JSONResponse:
             "error": f"Graph build failed: {exc}",
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
-    _GRAPH_CACHE["data"] = data
-    _GRAPH_CACHE["ts"] = time.time()
+    # Only cache if data looks complete
+    if data.get("stats", {}).get("nodes_by_type", {}).get("product", 0) > 0:
+        _GRAPH_CACHE["data"] = data
+        _GRAPH_CACHE["ts"] = time.time()
     return JSONResponse(content=data)

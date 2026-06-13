@@ -321,7 +321,7 @@ header{display:flex;align-items:center;gap:12px;padding:0 20px;
     <!-- edge breakdown -->
     <div class="edge-breakdown" id="edge-breakdown">Loading graph…</div>
     <div style="padding:2px 12px 4px;font-size:9px;color:var(--text-3);font-family:var(--mono)">
-      Entity graph: customers · suppliers · SKUs · raw materials — click any node to highlight neighbors
+      Backbone: SKU → raw material → supplier · click "+ Customers" to overlay order edges · click any node to highlight neighbors
     </div>
 
     <!-- toolbar -->
@@ -346,7 +346,7 @@ header{display:flex;align-items:center;gap:12px;padding:0 20px;
     <div style="padding:5px 12px;border-bottom:1px solid var(--border);flex-shrink:0;background:var(--card)">
       <div class="filter-scroll" id="filter-grp">
         <button class="filter-btn on" data-type="all"          onclick="filterNodes('all')">All</button>
-        <button class="filter-btn on" data-type="customer"     onclick="filterNodes('customer')">Customers</button>
+        <button class="filter-btn" data-type="customer"     onclick="filterNodes('customer')" title="Toggle customer → SKU edges">+ Customers</button>
         <button class="filter-btn on" data-type="supplier"     onclick="filterNodes('supplier')">Suppliers</button>
         <button class="filter-btn on" data-type="product"      onclick="filterNodes('product')">SKUs</button>
         <button class="filter-btn on" data-type="raw_material" onclick="filterNodes('raw_material')">Raw mat</button>
@@ -424,6 +424,9 @@ const ALERT_BORDER='#EF4444';
 
 /* ── State ────────────────────────────────────────────────────────── */
 let network=null, networkNodes=null, networkEdges=null;
+let showBuysEdges=false;   // "buys" edge layer hidden by default
+let buysEdgesCache=[];     // raw buys edge objects kept off the DataSet until toggled
+let cachedNodePositions=null; // {id: {x,y}} saved after first stabilization
 let rawGraphData=null;
 let allGraphEdges=[];              // full edge list for 1-hop search
 let currentSubgraphNodeIds=new Set(); // node IDs in current vis DataSet
@@ -640,11 +643,12 @@ async function loadGraph(){
 
 function updateStats(stats){
   const bt=stats.nodes_by_type||{};
-  setText('st-cust', bt.customer    ||stats.customer    ||'—');
-  setText('st-prod', bt.product     ||stats.product     ||'—');
-  setText('st-raw',  bt.raw_material||stats.raw_material||'—');
-  setText('st-supp', bt.supplier    ||stats.supplier    ||'—');
-  setText('st-alert',stats.below_min||'—');
+  const val=v=>(v!=null&&v!=='')?String(v):'—';
+  setText('st-cust', val(bt.customer   ??stats.customer   ));
+  setText('st-prod', val(bt.product    ??stats.product    ));
+  setText('st-raw',  val(bt.raw_material??stats.raw_material));
+  setText('st-supp', val(bt.supplier   ??stats.supplier   ));
+  setText('st-alert',val(stats.below_min));
   const ebt=stats.edges_by_type||{};
   const ebtStr=Object.entries(ebt).sort(([,a],[,b])=>b-a).map(([k,v])=>`${k}:${v}`).join('  ·  ');
   setText('edge-breakdown',ebtStr||'—');
@@ -690,41 +694,81 @@ function showGraphError(msg){
 /* ── Edge vis helper ─────────────────────────────────────────────── */
 function edgeToVis(e,i){
   return{
-    id:i,from:e.from,to:e.to,label:'',
-    color:{color:'rgba(26,25,24,.12)',highlight:'#BEF264',hover:'#BEF264'},
+    id:'e'+i,from:e.from,to:e.to,label:'',
+    color:{color:'rgba(26,25,24,.15)',highlight:'#BEF264',hover:'#BEF264'},
     arrows:{to:{enabled:true,scaleFactor:0.4}},
-    width:1,hoverWidth:2,selectionWidth:2.5,
+    width:1.2,hoverWidth:0,selectionWidth:0,
     _type:e.type,_label:e.label||'',
   };
 }
 
 /* ── renderNetwork ───────────────────────────────────────────────── */
-function renderNetwork(nodes,edges){
+function renderNetwork(nodes,allEdges){
   if(network){try{network.destroy();}catch(e){}network=null;}
   currentSubgraphNodeIds=new Set(nodes.map(n=>n.id));
-  networkNodes=new vis.DataSet(nodes.map(n=>nodeToVis(n)));
-  networkEdges=new vis.DataSet(edges.map((e,i)=>edgeToVis(e,i)));
+
+  // Separate "buys" (customer→SKU) from the backbone (bom + supply)
+  const backbone=allEdges.filter(e=>e.type!=='buys');
+  buysEdgesCache=allEdges.filter(e=>e.type==='buys');
+  showBuysEdges=false;
+
+  // Customer nodes are only connected via "buys" edges — hide them in backbone view
+  const customerIds=new Set(nodes.filter(n=>n.type==='customer').map(n=>n.id));
+
+  // Check if we have a cached layout matching this node set
+  const hasCachedPos=cachedNodePositions&&nodes.some(n=>cachedNodePositions[n.id]!=null);
+
+  networkNodes=new vis.DataSet(nodes.map(n=>{
+    const v=nodeToVis(n);
+    // Apply cached position if available
+    if(hasCachedPos&&cachedNodePositions[n.id]){
+      v.x=cachedNodePositions[n.id].x;
+      v.y=cachedNodePositions[n.id].y;
+    }
+    // Customers start hidden (they have no backbone edges)
+    if(customerIds.has(n.id))v.hidden=true;
+    return v;
+  }));
+  networkEdges=new vis.DataSet(backbone.map((e,i)=>edgeToVis(e,i)));
+
   const container=document.getElementById('graph-canvas');
+  const useStaticLayout=hasCachedPos;
+
   try{
     network=new vis.Network(container,{nodes:networkNodes,edges:networkEdges},{
-      nodes:{borderWidth:1.5,borderWidthSelected:3,
+      nodes:{
+        borderWidth:1.5,borderWidthSelected:3,
         font:{size:10,face:'Inter,sans-serif'},
-        shadow:{enabled:true,size:4,x:0,y:2,color:'rgba(0,0,0,.07)'}},
+        shadow:{enabled:false},
+      },
       edges:{
-        smooth:{type:'continuous',forceDirection:'none'},
+        smooth:false,
         font:{size:0},
         arrows:{to:{enabled:true,scaleFactor:0.4}},
-        color:{color:'rgba(26,25,24,.12)',highlight:'#BEF264',hover:'#BEF264'},
-        width:1,hoverWidth:2,selectionWidth:2.5,
+        color:{color:'rgba(26,25,24,.15)',highlight:'#BEF264',hover:'#BEF264'},
+        width:1.2,hoverWidth:0,selectionWidth:0,
       },
-      interaction:{hover:true,tooltipDelay:150,hideEdgesOnDrag:true,multiselect:false},
-      physics:{
-        enabled:true,solver:'barnesHut',
-        barnesHut:{gravitationalConstant:-4000,centralGravity:0.25,
-          springLength:130,springConstant:0.04,damping:0.1,avoidOverlap:0.4},
-        maxVelocity:80,
-        stabilization:{enabled:true,iterations:180,updateInterval:20},
+      interaction:{
+        hover:false,
+        dragNodes:true,
+        dragView:true,
+        zoomView:true,
+        selectConnectedEdges:false,
       },
+      physics: useStaticLayout
+        // Cached positions → skip physics entirely
+        ? {enabled:false}
+        // First load → run physics once then stop
+        : {
+            enabled:true,
+            solver:'barnesHut',
+            barnesHut:{
+              gravitationalConstant:-5000,centralGravity:0.2,
+              springLength:140,springConstant:0.04,damping:0.12,avoidOverlap:0.5,
+            },
+            maxVelocity:60,
+            stabilization:{enabled:true,iterations:150,updateInterval:25,fit:true},
+          },
       layout:{improvedLayout:false},
     });
   }catch(err){
@@ -732,17 +776,33 @@ function renderNetwork(nodes,edges){
     showGraphError('Rendering error: '+err.message);
     return;
   }
+
   let settled=false;
   const onSettled=()=>{
     if(settled)return;
     settled=true;
+    // CRITICAL: permanently disable physics — nodes never move again
+    network.setOptions({physics:{enabled:false}});
     network.stopSimulation();
+    // Cache positions for instant re-renders later
+    if(!hasCachedPos){
+      try{cachedNodePositions=network.getPositions();}catch(e){}
+    }
     setOverlay('',false);
-    network.fit({animation:{duration:400,easingFunction:'easeInOutQuad'}});
+    if(!hasCachedPos){
+      network.fit({animation:{duration:350,easingFunction:'easeInOutQuad'}});
+    }
   };
-  network.once('stabilizationIterationsDone',onSettled);
-  network.once('stabilized',onSettled);
-  setTimeout(onSettled,4000);
+
+  if(useStaticLayout){
+    // Already positioned — fire immediately
+    setTimeout(onSettled,50);
+  }else{
+    network.once('stabilizationIterationsDone',onSettled);
+    network.once('stabilized',onSettled);
+    setTimeout(onSettled,3500);
+  }
+
   network.on('click',params=>{
     if(params.nodes.length){
       highlightNeighbors(params.nodes[0]);
@@ -782,11 +842,28 @@ function highlightNeighbors(nodeId){
 
 function clearHighlight(){
   if(!networkNodes||!networkEdges)return;
-  networkNodes.update(networkNodes.getIds().map(id=>({id,opacity:1,color:undefined,borderWidth:1.5})));
+  // Restore all nodes to their original vis representation
+  if(!rawGraphData)return;
+  const byId={};
+  (rawGraphData.nodes||[]).forEach(n=>{byId[n.id]=n;});
+  networkNodes.update(networkNodes.getIds().map(id=>{
+    const n=byId[id];
+    if(!n)return{id,opacity:1,borderWidth:1.5};
+    const cfg=TC[n.type]||TC.kb_doc;
+    return{
+      id,opacity:1,
+      borderWidth:n.below_min?3:1.5,
+      color:{
+        background:cfg.color,border:n.below_min?ALERT_BORDER:cfg.border,
+        highlight:{background:'#BEF264',border:'#8AAA00'},
+        hover:{background:cfg.color,border:'#BEF264'},
+      },
+    };
+  }));
   networkEdges.update(networkEdges.get().map(e=>({
     id:e.id,
-    color:{color:'rgba(26,25,24,.12)',highlight:'#BEF264',hover:'#BEF264'},
-    width:1,
+    color:{color:'rgba(26,25,24,.15)',highlight:'#BEF264',hover:'#BEF264'},
+    width:1.2,
   })));
 }
 
@@ -844,14 +921,26 @@ function applyVisibility(){
   if(!networkNodes||!networkEdges)return;
   clearHighlight();
   const tf=activeTypeFilter;
+  // Customers are always hidden unless the buys-toggle is ON
+  const customerSet=rawGraphData&&rawGraphData.nodes
+    ?new Set(rawGraphData.nodes.filter(n=>n.type==='customer').map(n=>n.id)):new Set();
   if(tf==='all'){
-    networkNodes.update(networkNodes.getIds().map(id=>({id,hidden:false,opacity:1})));
-    networkEdges.update(networkEdges.getIds().map(id=>({id,hidden:false})));
+    networkNodes.update(networkNodes.getIds().map(id=>({
+      id,
+      hidden:customerSet.has(id)?!showBuysEdges:false,
+      opacity:1,
+    })));
+    // backbone edges always visible; buys only when toggled
+    networkEdges.update(networkEdges.get().map(e=>({
+      id:e.id, hidden: !showBuysEdges && e._type==='buys',
+    })));
     return;
   }
+  // Type filter: show only nodes of selected type + edges between them
   const visible=new Set();
   networkNodes.getIds().forEach(id=>{
     const item=networkNodes.get(id);
+    // When filtering to non-customer type, customers stay hidden regardless
     if(item&&item._type===tf)visible.add(id);
   });
   networkNodes.update(networkNodes.getIds().map(id=>({id,hidden:!visible.has(id),opacity:1})));
@@ -859,10 +948,46 @@ function applyVisibility(){
 }
 
 window.filterNodes=function(type){
+  if(type==='customer'){
+    // "Customers" toggles the buys-edge layer + customer node visibility
+    showBuysEdges=!showBuysEdges;
+    if(!networkNodes||!networkEdges)return;
+    const customerIds=rawGraphData&&rawGraphData.nodes
+      ?rawGraphData.nodes.filter(n=>n.type==='customer').map(n=>n.id):[];
+    if(showBuysEdges){
+      // Show customer nodes first, then add buys edges
+      networkNodes.update(customerIds.map(id=>({id,hidden:false})));
+      const existingIds=new Set(networkEdges.getIds());
+      const toAdd=buysEdgesCache
+        .map((e,i)=>edgeToVis(e,1000+i))
+        .filter(e=>!existingIds.has(e.id));
+      if(toAdd.length)networkEdges.add(toAdd);
+    }else{
+      // Remove buys edges, then hide customer nodes
+      const buysIds=networkEdges.get({filter:e=>e._type==='buys'}).map(e=>e.id);
+      if(buysIds.length)networkEdges.remove(buysIds);
+      networkNodes.update(customerIds.map(id=>({id,hidden:true})));
+    }
+    document.querySelector('[data-type="customer"]').classList.toggle('on',showBuysEdges);
+    return;
+  }
+  // Standard type filter
   activeTypeFilter=type;
+  // Reset buys layer when switching to a type filter
+  if(showBuysEdges&&networkEdges&&networkNodes){
+    const buysIds=networkEdges.get({filter:e=>e._type==='buys'}).map(e=>e.id);
+    if(buysIds.length)networkEdges.remove(buysIds);
+    showBuysEdges=false;
+    // Hide customer nodes again
+    if(rawGraphData&&rawGraphData.nodes){
+      const cids=rawGraphData.nodes.filter(n=>n.type==='customer').map(n=>n.id);
+      networkNodes.update(cids.map(id=>({id,hidden:true})));
+    }
+  }
   document.querySelectorAll('.filter-btn').forEach(b=>{
-    b.classList.toggle('on',b.dataset.type===type||type==='all');
+    b.classList.toggle('on',b.dataset.type===type||(type==='all'&&b.dataset.type!=='customer'));
   });
+  document.querySelector('[data-type="customer"]').classList.remove('on');
   applyVisibility();
 };
 
@@ -875,9 +1000,23 @@ window.resetView=function(){
   document.getElementById('graph-search').value='';
   closeDrawer();
   activeTypeFilter='all';
+  // Remove buys edges, hide customer nodes
+  if(networkEdges&&networkNodes){
+    if(showBuysEdges){
+      const buysIds=networkEdges.get({filter:e=>e._type==='buys'}).map(e=>e.id);
+      if(buysIds.length)networkEdges.remove(buysIds);
+    }
+    // Always re-hide customer nodes on reset
+    if(rawGraphData&&rawGraphData.nodes){
+      const cids=rawGraphData.nodes.filter(n=>n.type==='customer').map(n=>n.id);
+      networkNodes.update(cids.map(id=>({id,hidden:true})));
+    }
+  }
+  showBuysEdges=false;
   document.querySelectorAll('.filter-btn').forEach(b=>{
     b.classList.toggle('on',b.dataset.type==='all');
   });
+  document.querySelector('[data-type="customer"]')?.classList.remove('on');
   clearHighlight();
   applyVisibility();
   fitGraph();

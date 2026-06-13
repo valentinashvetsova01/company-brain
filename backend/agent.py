@@ -86,27 +86,81 @@ def _search_kb_impl(query: str, doc_ids: list[str] | None = None) -> list[dict]:
 def _make_pdf(title: str, sections: list[dict]) -> bytes:
     from fpdf import FPDF  # type: ignore
 
-    pdf = FPDF()
+    # A4 portrait: 210mm wide, 10mm margins each side → 190mm usable
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_margins(10, 10, 10)
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
-    eff_w = pdf.w - pdf.l_margin - pdf.r_margin
+    eff_w = pdf.w - pdf.l_margin - pdf.r_margin  # 190.0 mm
 
+    # ── Title ───────────────────────────────────────────────────────
     pdf.set_font("Helvetica", "B", 16)
     pdf.cell(eff_w, 10, title[:80], new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
+
     for sec in sections:
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(eff_w, 8, sec.get("heading", "")[:80], new_x="LMARGIN", new_y="NEXT")
-        pdf.set_font("Helvetica", "", 10)
+        # Section heading
+        if heading := sec.get("heading", ""):
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.cell(eff_w, 8, heading[:80], new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(2)
+
+        # Free text block
         if text := sec.get("text", ""):
+            pdf.set_font("Helvetica", "", 10)
             safe = text.replace("\r\n", "\n").replace("\r", "\n")
             pdf.multi_cell(eff_w, 6, safe[:2000])
-        if rows := sec.get("rows", []):
-            col_w = max(eff_w / max(len(rows[0]), 1), 10)
-            for row in rows:
-                line = "  |  ".join(str(c)[:30] for c in row)
-                pdf.multi_cell(eff_w, 6, line[:200])
+            pdf.ln(2)
+
+        # Table rows
+        rows = sec.get("rows") or []
+        if not rows:
+            continue
+
+        n_cols = len(rows[0])
+
+        # Column widths that sum exactly to eff_w (190 mm)
+        if n_cols == 4:
+            col_widths = [38.0, 82.0, 35.0, 35.0]   # SKU | Desc | On-Hand | Min
+        elif n_cols == 3:
+            col_widths = [40.0, 110.0, 40.0]
+        elif n_cols == 2:
+            col_widths = [85.0, 105.0]
+        elif n_cols == 1:
+            col_widths = [eff_w]
+        else:
+            w = round(eff_w / n_cols, 2)
+            col_widths = [w] * n_cols
+            col_widths[-1] = round(eff_w - w * (n_cols - 1), 2)  # absorb rounding
+
+        ROW_H = 7.0
+
+        for ri, row in enumerate(rows):
+            is_header = (ri == 0)
+            if is_header:
+                pdf.set_font("Helvetica", "B", 10)
+                pdf.set_fill_color(220, 220, 220)
+            else:
+                pdf.set_font("Helvetica", "", 9)
+
+            pdf.set_x(pdf.l_margin)
+            for ci, (cell_val, cw) in enumerate(zip(row, col_widths)):
+                raw = str(cell_val)
+                # Estimate max chars that fit: Helvetica ~1.85mm/char at 9-10pt
+                pt = 10 if is_header else 9
+                max_chars = max(4, int(cw / (pt * 0.19)))
+                if len(raw) > max_chars:
+                    raw = raw[:max_chars - 1] + "…"
+                align = "C" if is_header else ("R" if ci >= 2 else "L")
+                pdf.cell(cw, ROW_H, raw, border=1, align=align,
+                         fill=is_header, new_x="RIGHT", new_y="TOP")
+            pdf.ln(ROW_H)
+
         pdf.ln(3)
+
+    # Strip trailing blank pages: fpdf2 may produce one if auto-page-break
+    # fired right at the end. We can't easily detect this without hacks, but
+    # by NOT calling add_page() after the last section we avoid it.
     return bytes(pdf.output())
 
 
@@ -220,8 +274,35 @@ def _generate_artifact_impl(fmt: str, title: str, sections: list[dict]) -> dict:
                 col_fields: list[str] = sec.pop("column_fields", [])
                 col_headers: list[str] = sec.pop("column_headers", [])
                 try:
+                    from urllib.parse import urlparse, parse_qs
+                    # Parse filters embedded in the endpoint URL
+                    parsed = urlparse(endpoint)
+                    filter_params = {
+                        k: v[0]
+                        for k, v in parse_qs(parsed.query).items()
+                        if k not in ("limit", "offset", "search")
+                    }
+
                     result = _api_call(endpoint, {})
                     items = result.get("data", [])
+
+                    # Client-side filter (API may ignore query params server-side)
+                    def _item_matches(item: dict) -> bool:
+                        for k, v in filter_params.items():
+                            iv = item.get(k)
+                            if v.lower() == "true":
+                                if not iv:
+                                    return False
+                            elif v.lower() == "false":
+                                if iv:
+                                    return False
+                            else:
+                                if str(iv).lower() != v.lower():
+                                    return False
+                        return True
+
+                    items = [i for i in items if _item_matches(i)]
+
                     if items:
                         if not col_fields:
                             col_fields = list(items[0].keys())
